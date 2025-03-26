@@ -56,7 +56,8 @@ bool is_using_host_mntns(void)
     return st1.st_ino == st2.st_ino;
 }
 
-int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size, int fd_usernsd)
+int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
+                int fd_usernsd, int userns_fd)
 {
     int ret;
     void *stack;
