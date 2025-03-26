@@ -56,12 +56,13 @@ bool is_using_host_mntns(void)
     return st1.st_ino == st2.st_ino;
 }
 
-int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
+int userns_call(void *arg, int flags, void *data, size_t size_data,
                 int fd_usernsd)
 {
     int ret;
     void *stack;
     pid_t pid;
+    int (*fn)(void *) = (int (*)(void *))arg;
 
     stack = malloc(4096);
     if (!stack) {
@@ -69,7 +70,7 @@ int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
         return -1;
     }
 
-    pid = clone(fn, stack + 4096, flags | CLONE_VM | CLONE_FILES | SIGCHLD, arg);
+    pid = clone(fn, stack + 4096, flags | CLONE_VM | CLONE_FILES | SIGCHLD, data);
     if (pid < 0) {
         pr_err("Failed to clone process for usernsd call\n");
         free(stack);
