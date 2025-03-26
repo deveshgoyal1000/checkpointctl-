@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include "common/compiler.h"
 
-extern int userns_call(int (*fn)(void *), void *arg, size_t arg_size,
+extern int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
 		      int fd_usernsd);
 
 /* Check if the process is running in its own user namespace */
