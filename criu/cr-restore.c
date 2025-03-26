@@ -49,6 +49,7 @@
 #include "crtools.h"
 #include "uffd.h"
 #include "namespaces.h"
+#include "userns.h"
 #include "mem.h"
 #include "mount.h"
 #include "fsnotify.h"
@@ -75,7 +76,6 @@
 #include "sk-queue.h"
 #include "sigframe.h"
 #include "fdstore.h"
-#include "string.h"
 #include "memfd.h"
 #include "timens.h"
 #include "bpfmap.h"
@@ -91,17 +91,22 @@
 
 #include "protobuf.h"
 #include "images/sa.pb-c.h"
+#include "images/core.pb-c.h"
+#include "images/core-x86.pb-c.h"
+#include "images/core-arm.pb-c.h"
+#include "images/core-aarch64.pb-c.h"
+#include "images/core-ppc64.pb-c.h"
+#include "images/core-s390.pb-c.h"
+#include "images/core-mips.pb-c.h"
+#include "images/creds.pb-c.h"
 #include "images/timer.pb-c.h"
-#include "images/vma.pb-c.h"
-#include "images/rlimit.pb-c.h"
-#include "images/pagemap.pb-c.h"
-#include "images/siginfo.pb-c.h"
+#include "images/utsns.pb-c.h"
+#include "images/pidns.pb-c.h"
+#include "images/ipcns.pb-c.h"
 
-#include "restore.h"
-
-#include "cr-errno.h"
-#include "timer.h"
-#include "sigact.h"
+/* Forward declarations */
+static int mount_proc(void);
+static int mount_proc_with_usernsd(void);
 
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread __export_restore_thread
@@ -1109,9 +1114,6 @@ static inline int fork_with_pid(struct pstree_item *item)
 				rsti(item)->cg_set = ca.core->tc->cg_set;
 		}
 
-		if (ca.core->tc->has_stop_signo)
-			item->pid->stop_signo = ca.core->tc->stop_signo;
-
 		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid->state);
 			return -1;
@@ -1424,35 +1426,21 @@ static void restore_pgid(void)
 		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
 }
 
-static int __legacy_mount_proc(void)
-{
-	char proc_mountpoint[] = "/tmp/crtools-proc.XXXXXX";
-	int fd;
-
-	if (mkdtemp(proc_mountpoint) == NULL) {
-		pr_perror("mkdtemp failed %s", proc_mountpoint);
-		return -1;
-	}
-
-	pr_info("Mount procfs in %s\n", proc_mountpoint);
-	if (mount("proc", proc_mountpoint, "proc", MS_MGC_VAL | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL)) {
-		pr_perror("mount failed");
-		if (rmdir(proc_mountpoint))
-			pr_perror("Unable to remove %s", proc_mountpoint);
-		return -1;
-	}
-
-	fd = open_detach_mount(proc_mountpoint);
-	return fd;
-}
-
 static int mount_proc(void)
 {
 	int fd, ret;
+	bool in_userns = (root_ns_mask & CLONE_NEWUSER);
+	bool in_mntns = (root_ns_mask & CLONE_NEWNS);
 
-	if (root_ns_mask == 0)
+	/*
+	 * If we're in a user namespace but using host's mount namespace,
+	 * we need to mount proc through usernsd to have proper capabilities
+	 */
+	if (in_userns && !in_mntns) {
+		fd = ret = mount_proc_with_usernsd();
+	} else if (root_ns_mask == 0) {
 		fd = ret = open("/proc", O_DIRECTORY);
-	else {
+	} else {
 		if (kdat.has_fsopen)
 			fd = ret = mount_detached_fs("proc");
 		else
@@ -1467,531 +1455,28 @@ static int mount_proc(void)
 	return ret;
 }
 
-/*
- * Tasks cannot change sid (session id) arbitrary, but can either
- * inherit one from ancestor, or create a new one with id equal to
- * their pid. Thus sid-s restore is tied with children creation.
- */
-
-static int create_children_and_session(void)
+static int mount_proc_with_usernsd(void)
 {
-	int ret;
-	struct pstree_item *child;
-
-	pr_info("Restoring children in alien sessions:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (!restore_before_setsid(child))
-			continue;
-
-		BUG_ON(child->born_sid != -1 && getsid(0) != child->born_sid);
-
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			return ret;
-	}
-
-	if (current->parent)
-		restore_sid();
-
-	pr_info("Restoring children in our session:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (restore_before_setsid(child))
-			continue;
-
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int __restore_task_with_children(void *_arg)
-{
-	struct cr_clone_arg *ca = _arg;
-	pid_t pid;
-	int ret;
-
-	current = ca->item;
-
-	if (current != root_item) {
-		char buf[12];
-		int fd;
-
-		/* Determine PID in CRIU's namespace */
-		fd = get_service_fd(CR_PROC_FD_OFF);
-		if (fd < 0)
-			goto err;
-
-		ret = readlinkat(fd, "self", buf, sizeof(buf) - 1);
-		if (ret < 0) {
-			pr_perror("Unable to read the /proc/self link");
-			goto err;
-		}
-		buf[ret] = '\0';
-
-		current->pid->real = atoi(buf);
-		pr_debug("PID: real %d virt %d\n", current->pid->real, vpid(current));
-	}
-
-	pid = getpid();
-	if (vpid(current) != pid) {
-		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
-		set_task_cr_err(EEXIST);
-		goto err;
-	}
-
-	if (log_init_by_pid(vpid(current)))
-		goto err;
-
-	if (current->parent == NULL) {
-		/*
-		 * The root task has to be in its namespaces before executing
-		 * ACT_SETUP_NS scripts, so the root netns has to be created here
-		 */
-		if (root_ns_mask & CLONE_NEWNET) {
-			struct ns_id *ns = net_get_root_ns();
-			if (ns->ext_key)
-				ret = net_set_ext(ns);
-			else
-				ret = unshare(CLONE_NEWNET);
-			if (ret) {
-				pr_perror("Can't unshare net-namespace");
-				goto err;
-			}
-		}
-
-		if (root_ns_mask & CLONE_NEWTIME) {
-			if (prepare_timens(current->ids->time_ns_id))
-				goto err;
-		} else if (kdat.has_timens) {
-			if (prepare_timens(0))
-				goto err;
-		}
-
-		if (set_opts_cap_eff())
-			goto err;
-
-		/* Wait prepare_userns */
-		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
-			goto err;
-
-		/*
-		 * Since we don't support nesting of cgroup namespaces, let's
-		 * only set up the cgns (if it exists) in the init task.
-		 */
-		if (prepare_cgroup_namespace(current) < 0)
-			goto err;
-	}
-
-	if (needs_prep_creds(current) && (prepare_userns_creds()))
-		goto err;
-
-	/*
-	 * Call this _before_ forking to optimize cgroups
-	 * restore -- if all tasks live in one set of cgroups
-	 * we will only move the root one there, others will
-	 * just have it inherited.
-	 */
-	if (restore_task_cgroup(current) < 0)
-		goto err;
-
-	/* Restore root task */
-	if (current->parent == NULL) {
-		if (join_namespaces()) {
-			pr_perror("Join namespaces failed");
-			goto err;
-		}
-
-		pr_info("Calling restore_sid() for init\n");
-		restore_sid();
-
-		/*
-		 * We need non /proc proc mount for restoring pid and mount
-		 * namespaces and do not care for the rest of the cases.
-		 * Thus -- mount proc at custom location for any new namespace
-		 */
-		if (mount_proc())
-			goto err;
-
-		if (!files_collected() && collect_image(&tty_cinfo))
-			goto err;
-		if (collect_images(before_ns_cinfos, ARRAY_SIZE(before_ns_cinfos)))
-			goto err;
-
-		if (prepare_namespace(current, ca->clone_flags))
-			goto err;
-
-		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
-			goto err;
-
-		if (root_prepare_shared())
-			goto err;
-
-		if (populate_root_fd_off())
-			goto err;
-	}
-
-	if (setup_newborn_fds(current))
-		goto err;
-
-	if (restore_task_mnt_ns(current))
-		goto err;
-
-	if (prepare_mappings(current))
-		goto err;
-
-	if (prepare_sigactions(ca->core) < 0)
-		goto err;
-
-	if (fault_injected(FI_RESTORE_ROOT_ONLY)) {
-		pr_info("fault: Restore root task failure!\n");
-		kill(getpid(), SIGKILL);
-	}
-
-	if (open_transport_socket())
-		goto err;
-
-	timing_start(TIME_FORK);
-
-	if (create_children_and_session())
-		goto err;
-
-	timing_stop(TIME_FORK);
-
-	if (populate_pid_proc())
-		goto err;
-
-	sfds_protected = true;
-
-	if (unmap_guard_pages(current))
-		goto err;
-
-	restore_pgid();
-
-	if (current->parent == NULL) {
-		/*
-		 * Wait when all tasks passed the CR_STATE_FORKING stage.
-		 * The stage was started by criu, but now it waits for
-		 * the CR_STATE_RESTORE to finish. See comment near the
-		 * CR_STATE_FORKING macro for details.
-		 *
-		 * It means that all tasks entered into their namespaces.
-		 */
-		if (restore_wait_other_tasks())
-			goto err;
-		fini_restore_mntns();
-		__restore_switch_stage(CR_STATE_RESTORE);
-	} else {
-		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
-			goto err;
-	}
-
-	if (restore_one_task(vpid(current), ca->core))
-		goto err;
-
-	return 0;
-
-err:
-	if (current->parent == NULL)
-		futex_abort_and_wake(&task_entries->nr_in_progress);
-	exit(1);
-}
-
-static int restore_task_with_children(void *_arg)
-{
-	struct cr_clone_arg *arg = _arg;
-	struct pstree_item *item = arg->item;
-	CoreEntry *core = arg->core;
-
-	return arch_shstk_trampoline(item, core, __restore_task_with_children,
-				     arg);
-}
-
-int __attribute((weak)) arch_ptrace_restore(int pid, struct pstree_item *item);
-int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
-
-static int attach_to_tasks(bool root_seized)
-{
-	struct pstree_item *item;
-
-	for_each_pstree_item(item) {
-		int status, i;
-
-		if (!task_alive(item))
-			continue;
-
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
-
-		for (i = 0; i < item->nr_threads; i++) {
-			pid_t pid = item->threads[i].real;
-
-			if (item != root_item || !root_seized || i != 0) {
-				if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
-					pr_perror("Can't attach to %d", pid);
-					return -1;
-				}
-			}
-			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
-				pr_perror("Can't interrupt the %d task", pid);
-				return -1;
-			}
-
-			if (wait4(pid, &status, __WALL, NULL) != pid) {
-				pr_perror("waitpid(%d) failed", pid);
-				return -1;
-			}
-
-			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
-				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
-				return -1;
-			}
-			if (arch_ptrace_restore(pid, item))
-				return -1;
-			/*
-			 * Suspend seccomp if necessary. We need to do this because
-			 * although seccomp is restored at the very end of the
-			 * restorer blob (and the final sigreturn is ok), here we're
-			 * doing an munmap in the process, which may be blocked by
-			 * seccomp and cause the task to be killed.
-			 */
-			if (rsti(item)->has_seccomp && ptrace_suspend_seccomp(pid) < 0)
-				pr_err("failed to suspend seccomp, restore will probably fail...\n");
-
-			if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
-				pr_perror("Unable to resume %d", pid);
-				return -1;
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int restore_rseq_cs(void)
-{
-	struct pstree_item *item;
-
-	for_each_pstree_item(item) {
-		int i;
-
-		if (!task_alive(item))
-			continue;
-
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads)) {
-				pr_err("restore_rseq_cs: parse_threads failed\n");
-				return -1;
-			}
-		}
-
-		for (i = 0; i < item->nr_threads; i++) {
-			pid_t pid = item->threads[i].real;
-			struct rst_rseq *rseqe = rsti(item)->rseqe;
-
-			if (!rseqe) {
-				pr_err("restore_rseq_cs: rsti(item)->rseqe is NULL\n");
-				return -1;
-			}
-
-			if (!rseqe[i].rseq_cs_pointer || !rseqe[i].rseq_abi_pointer)
-				continue;
-
-			if (ptrace_poke_area(
-				    pid, &rseqe[i].rseq_cs_pointer,
-				    decode_pointer(rseqe[i].rseq_abi_pointer + offsetof(struct criu_rseq, rseq_cs)),
-				    sizeof(uint64_t))) {
-				pr_err("Can't restore rseq_cs pointer (pid: %d)\n", pid);
-				return -1;
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int catch_tasks(bool root_seized)
-{
-	struct pstree_item *item;
-
-	for_each_pstree_item(item) {
-		int status, i, ret;
-
-		if (!task_alive(item))
-			continue;
-
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
-
-		for (i = 0; i < item->nr_threads; i++) {
-			pid_t pid = item->threads[i].real;
-
-			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
-				pr_perror("Can't interrupt the %d task", pid);
-				return -1;
-			}
-
-			if (wait4(pid, &status, __WALL, NULL) != pid) {
-				pr_perror("waitpid(%d) failed", pid);
-				return -1;
-			}
-
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
-			if (ret < 0)
-				return -1;
-		}
-	}
-
-	return 0;
-}
-
-static void finalize_restore(void)
-{
-	struct pstree_item *item;
-
-	for_each_pstree_item(item) {
-		pid_t pid = item->pid->real;
-		struct parasite_ctl *ctl;
-		unsigned long restorer_addr;
-
-		if (!task_alive(item))
-			continue;
-
-		/* Unmap the restorer blob */
-		ctl = compel_prepare_noctx(pid);
-		if (ctl == NULL)
-			continue;
-
-		restorer_addr = (unsigned long)rsti(item)->munmap_restorer;
-		if (compel_unmap(ctl, restorer_addr))
-			pr_err("Failed to unmap restorer from %d\n", pid);
-
-		xfree(ctl);
-
-		if (opts.final_state == TASK_STOPPED)
-			kill(item->pid->real, SIGSTOP);
-		else if (item->pid->state == TASK_STOPPED) {
-			if (item->pid->stop_signo > 0)
-				kill(item->pid->real, item->pid->stop_signo);
-			else
-				kill(item->pid->real, SIGSTOP);
-		}
-	}
-}
-
-static int finalize_restore_detach(void)
-{
-	struct pstree_item *item;
-
-	for_each_pstree_item(item) {
-		pid_t pid;
-		int i;
-
-		if (!task_alive(item))
-			continue;
-
-		for (i = 0; i < item->nr_threads; i++) {
-			pid = item->threads[i].real;
-			if (pid < 0) {
-				pr_err("pstree item has invalid pid %d\n", pid);
-				continue;
-			}
-
-			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
-				pr_perror("Restoring regs for %d failed", pid);
-				return -1;
-			}
-			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
-				pr_perror("Unable to detach %d", pid);
-				return -1;
-			}
-		}
-	}
-	return 0;
-}
-
-static void ignore_kids(void)
-{
-	struct sigaction sa = { .sa_handler = SIG_DFL };
-
-	if (sigaction(SIGCHLD, &sa, NULL) < 0)
-		pr_perror("Restoring CHLD sigaction failed");
-}
-
-static unsigned int saved_loginuid;
-
-static int prepare_userns_hook(void)
-{
-	int ret;
-
-	if (kdat.luid != LUID_FULL)
-		return 0;
-	/*
-	 * Save old loginuid and set it to INVALID_UID:
-	 * this value means that loginuid is unset and it will be inherited.
-	 * After you set some value to /proc/<>/loginuid it can't be changed
-	 * inside container due to permissions.
-	 * But you still can set this value if it was unset.
-	 */
-	saved_loginuid = parse_pid_loginuid(getpid(), &ret, false);
-	if (ret < 0)
-		return -1;
-
-	if (prepare_loginuid(INVALID_UID) < 0) {
-		pr_err("Setting loginuid for CT init task failed, CAP_AUDIT_CONTROL?\n");
-		return -1;
-	}
-	return 0;
-}
-
-static void restore_origin_ns_hook(void)
-{
-	if (kdat.luid != LUID_FULL)
-		return;
-
-	/* not critical: it does not affect CT in any way */
-	if (prepare_loginuid(saved_loginuid) < 0)
-		pr_err("Restore original /proc/self/loginuid failed\n");
-}
-
-static int write_restored_pid(void)
-{
-	int pid;
-
-	if (!opts.pidfile)
-		return 0;
-
-	pid = root_item->pid->real;
-
-	if (write_pidfile(pid) < 0) {
-		pr_perror("Can't write pidfile");
+	char proc_mountpoint[] = "/tmp/crtools-proc.XXXXXX";
+	int fd;
+
+	if (mkdtemp(proc_mountpoint) == NULL) {
+		pr_perror("mkdtemp failed %s", proc_mountpoint);
 		return -1;
 	}
 
-	return 0;
-}
-
-static void reap_zombies(void)
-{
-	while (1) {
-		pid_t pid = wait(NULL);
-		if (pid == -1) {
-			if (errno != ECHILD)
-				pr_perror("Error while waiting for pids");
-			return;
-		}
+	pr_info("Mount procfs via usernsd in %s\n", proc_mountpoint);
+	
+	/* Use usernsd to mount proc with proper capabilities */
+	if (userns_call("mount_proc", proc_mountpoint, strlen(proc_mountpoint) + 1, -1)) {
+		pr_perror("Failed to mount proc via usernsd");
+		if (rmdir(proc_mountpoint))
+			pr_perror("Unable to remove %s", proc_mountpoint);
+		return -1;
 	}
+
+	fd = open_detach_mount(proc_mountpoint);
+	return fd;
 }
 
 static int restore_root_task(struct pstree_item *init)
@@ -3113,7 +2598,7 @@ static void *restorer_munmap_addr(CoreEntry *core, void *restorer_blob)
 void arch_rsti_init(struct pstree_item *p) __attribute__((weak));
 void arch_rsti_init(struct pstree_item *p) {}
 
-static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, unsigned long alen, CoreEntry *core)
+static int sigreturn_restore(pid_t pid, struct task_restore_args *ta, unsigned long alen, CoreEntry *core)
 {
 	void *mem = MAP_FAILED;
 	void *restore_task_exec_start;
@@ -3173,9 +2658,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	rst_mem_size = rst_mem_lock();
 	memzone_size = round_up(sizeof(struct restore_mem_zone) * current->nr_threads, page_size());
-	task_args->bootstrap_len = restorer_len + memzone_size + alen + rst_mem_size;
-	BUG_ON(task_args->bootstrap_len & (PAGE_SIZE - 1));
-	pr_info("%d threads require %ldK of memory\n", current->nr_threads, KBYTES(task_args->bootstrap_len));
+	ta->bootstrap_len = restorer_len + memzone_size + alen + rst_mem_size;
+	BUG_ON(ta->bootstrap_len & (PAGE_SIZE - 1));
+	pr_info("%d threads require %ldK of memory\n", current->nr_threads, KBYTES(ta->bootstrap_len));
 
 	if (core_is_compat(core))
 		vdso_maps_rt = vdso_maps_compat;
@@ -3190,7 +2675,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		if (vdso_maps_rt.sym.vvar_size != VVAR_BAD_SIZE)
 			vdso_rt_size += vdso_maps_rt.sym.vvar_size;
 	}
-	task_args->bootstrap_len += vdso_rt_size;
+	ta->bootstrap_len += vdso_rt_size;
 
 	/*
 	 * Restorer is a blob (code + args) that will get mapped in some
@@ -3203,13 +2688,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * or inited from scratch).
 	 */
 
-	mem = (void *)restorer_get_vma_hint(&vmas->h, &self_vmas.h, task_args->bootstrap_len);
+	mem = (void *)restorer_get_vma_hint(&vmas->h, &self_vmas.h, ta->bootstrap_len);
 	if (mem == (void *)-1) {
-		pr_err("No suitable area for task_restore bootstrap (%ldK)\n", task_args->bootstrap_len);
+		pr_err("No suitable area for task_restore bootstrap (%ldK)\n", ta->bootstrap_len);
 		goto err;
 	}
 
-	pr_info("Found bootstrap VMA hint at: %p (needs ~%ldK)\n", mem, KBYTES(task_args->bootstrap_len));
+	pr_info("Found bootstrap VMA hint at: %p (needs ~%ldK)\n", mem, KBYTES(ta->bootstrap_len));
 
 	ret = remap_restorer_blob(mem);
 	if (ret < 0)
@@ -3219,11 +2704,11 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * Prepare a memory map for restorer. Note a thread space
 	 * might be completely unused so it's here just for convenience.
 	 */
-	task_args->clone_restore_fn = restorer_sym(mem, arch_export_restore_thread);
+	ta->clone_restore_fn = restorer_sym(mem, arch_export_restore_thread);
 	restore_task_exec_start = restorer_sym(mem, arch_export_restore_task);
 	rsti(current)->munmap_restorer = restorer_munmap_addr(core, mem);
 
-	task_args->bootstrap_start = mem;
+	ta->bootstrap_start = mem;
 	mem += restorer_len;
 
 	/* VMA we need for stacks and sigframes for threads */
@@ -3237,15 +2722,15 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	mem += memzone_size;
 
 	/* New home for task_restore_args and thread_restore_args */
-	task_args = mremap(task_args, alen, alen, MREMAP_MAYMOVE | MREMAP_FIXED, mem);
-	if (task_args != mem) {
+	ta = mremap(ta, alen, alen, MREMAP_MAYMOVE | MREMAP_FIXED, mem);
+	if (ta != mem) {
 		pr_perror("Can't move task args");
 		goto err;
 	}
 
-	task_args->rst_mem = mem;
-	task_args->rst_mem_size = rst_mem_size + alen;
-	thread_args = (struct thread_restore_args *)(task_args + 1);
+	ta->rst_mem = mem;
+	ta->rst_mem_size = rst_mem_size + alen;
+	thread_args = (struct thread_restore_args *)(ta + 1);
 
 	/*
 	 * And finally -- the rest arguments referenced by task_ and
@@ -3267,14 +2752,14 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * it gets unmapped at the very end of __export_restore_task
 	 */
 
-	task_args->proc_fd = dup(get_service_fd(PROC_FD_OFF));
-	if (task_args->proc_fd < 0) {
+	ta->proc_fd = dup(get_service_fd(PROC_FD_OFF));
+	if (ta->proc_fd < 0) {
 		pr_perror("can't dup proc fd");
 		goto err;
 	}
 
-	task_args->breakpoint = &rsti(current)->breakpoint;
-	task_args->fault_strategy = fi_strategy;
+	ta->breakpoint = &rsti(current)->breakpoint;
+	ta->fault_strategy = fi_strategy;
 
 	sigemptyset(&blockmask);
 	sigaddset(&blockmask, SIGCHLD);
@@ -3284,54 +2769,54 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		return -1;
 	}
 
-	task_args->task_entries = rst_mem_remap_ptr(task_entries_pos, RM_SHREMAP);
+	ta->task_entries = rst_mem_remap_ptr(task_entries_pos, RM_SHREMAP);
 
-	task_args->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
-	task_args->premmapped_len = rsti(current)->premmapped_len;
+	ta->premmapped_addr = (unsigned long)rsti(current)->premmapped_addr;
+	ta->premmapped_len = rsti(current)->premmapped_len;
 
-	task_args->task_size = kdat.task_size;
+	ta->task_size = kdat.task_size;
 #ifdef ARCH_HAS_LONG_PAGES
-	task_args->page_size = PAGE_SIZE;
+	ta->page_size = PAGE_SIZE;
 #endif
 
-	RST_MEM_FIXUP_PPTR(task_args->vmas);
-	RST_MEM_FIXUP_PPTR(task_args->rings);
-	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
-	RST_MEM_FIXUP_PPTR(task_args->timerfd);
-	RST_MEM_FIXUP_PPTR(task_args->posix_timers);
-	RST_MEM_FIXUP_PPTR(task_args->siginfo);
-	RST_MEM_FIXUP_PPTR(task_args->rlims);
-	RST_MEM_FIXUP_PPTR(task_args->helpers);
-	RST_MEM_FIXUP_PPTR(task_args->zombies);
-	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
-	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
+	RST_MEM_FIXUP_PPTR(ta->vmas);
+	RST_MEM_FIXUP_PPTR(ta->rings);
+	RST_MEM_FIXUP_PPTR(ta->tcp_socks);
+	RST_MEM_FIXUP_PPTR(ta->timerfd);
+	RST_MEM_FIXUP_PPTR(ta->posix_timers);
+	RST_MEM_FIXUP_PPTR(ta->siginfo);
+	RST_MEM_FIXUP_PPTR(ta->rlims);
+	RST_MEM_FIXUP_PPTR(ta->helpers);
+	RST_MEM_FIXUP_PPTR(ta->zombies);
+	RST_MEM_FIXUP_PPTR(ta->vma_ios);
+	RST_MEM_FIXUP_PPTR(ta->inotify_fds);
 
-	task_args->compatible_mode = core_is_compat(core);
+	ta->compatible_mode = core_is_compat(core);
 	/*
 	 * Arguments for task restoration.
 	 */
 
 	BUG_ON(core->mtype != CORE_ENTRY__MARCH);
 
-	task_args->logfd = log_get_fd();
-	task_args->loglevel = log_get_loglevel();
-	log_get_logstart(&task_args->logstart);
-	task_args->sigchld_act = sigchld_act;
+	ta->logfd = log_get_fd();
+	ta->loglevel = log_get_loglevel();
+	log_get_logstart(&ta->logstart);
+	ta->sigchld_act = sigchld_act;
 
-	strncpy(task_args->comm, core->tc->comm, TASK_COMM_LEN - 1);
-	task_args->comm[TASK_COMM_LEN - 1] = 0;
+	strncpy(ta->comm, core->tc->comm, TASK_COMM_LEN - 1);
+	ta->comm[TASK_COMM_LEN - 1] = 0;
 
-	prep_libc_rseq_info(&task_args->libc_rseq);
+	prep_libc_rseq_info(&ta->libc_rseq);
 
-	task_args->uid = opts.uid;
+	ta->uid = opts.uid;
 	for (i = 0; i < CR_CAP_SIZE; i++)
-		task_args->cap_eff[i] = opts.cap_eff[i];
+		ta->cap_eff[i] = opts.cap_eff[i];
 
 	/*
 	 * Fill up per-thread data.
 	 */
 	creds_pos_next = creds_pos;
-	siginfo_n = task_args->siginfo_n;
+	siginfo_n = ta->siginfo_n;
 	arch_rsti_init(current);
 	for (i = 0; i < current->nr_threads; i++) {
 		CoreEntry *tcore;
@@ -3344,13 +2829,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 #endif
 		thread_args[i].pid = current->threads[i].ns[0].virt;
 		thread_args[i].siginfo_n = siginfo_priv_nr[i];
-		thread_args[i].siginfo = task_args->siginfo;
+		thread_args[i].siginfo = ta->siginfo;
 		thread_args[i].siginfo += siginfo_n;
 		siginfo_n += thread_args[i].siginfo_n;
 
 		/* skip self */
 		if (thread_args[i].pid == pid) {
-			task_args->t = thread_args + i;
+			ta->t = thread_args + i;
 			tcore = core;
 #ifdef CONFIG_MIPS
 			mips_blkset.sig[0] = tcore->tc->blk_sigset;
@@ -3380,7 +2865,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			goto err;
 		}
 
-		thread_args[i].ta = task_args;
+		thread_args[i].ta = ta;
 		thread_args[i].gpregs = *CORE_THREAD_ARCH_INFO(tcore)->gpregs;
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
@@ -3442,13 +2927,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	 * self-vmas are unmaped.
 	 */
 	mem += rst_mem_size;
-	task_args->vdso_rt_parked_at = (unsigned long)mem;
-	task_args->vdso_maps_rt = vdso_maps_rt;
-	task_args->vdso_rt_size = vdso_rt_size;
-	task_args->can_map_vdso = kdat.can_map_vdso;
-	task_args->has_clone3_set_tid = kdat.has_clone3_set_tid;
+	ta->vdso_rt_parked_at = (unsigned long)mem;
+	ta->vdso_maps_rt = vdso_maps_rt;
+	ta->vdso_rt_size = vdso_rt_size;
+	ta->can_map_vdso = kdat.can_map_vdso;
+	ta->has_clone3_set_tid = kdat.has_clone3_set_tid;
 
-	new_sp = restorer_stack(task_args->t->mz);
+	new_sp = restorer_stack(ta->t->mz);
 
 	/* No longer need it */
 	core_entry__free_unpacked(core, NULL);
@@ -3457,17 +2942,17 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	/*
 	 * Now prepare run-time data for threads restore.
 	 */
-	task_args->nr_threads = current->nr_threads;
-	task_args->thread_args = thread_args;
+	ta->nr_threads = current->nr_threads;
+	ta->thread_args = thread_args;
 
-	task_args->auto_dedup = opts.auto_dedup;
+	ta->auto_dedup = opts.auto_dedup;
 
 	/*
 	 * In the restorer we need to know if it is SELinux or not. For SELinux
 	 * we must change the process context before creating threads. For
 	 * Apparmor we can change each thread after they have been created.
 	 */
-	task_args->lsm_type = kdat.lsm;
+	ta->lsm_type = kdat.lsm;
 
 	/*
 	 * Make root and cwd restore _that_ late not to break any
@@ -3495,15 +2980,15 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		"task_args->nr_threads: %d\n"
 		"task_args->clone_restore_fn: %p\n"
 		"task_args->thread_args: %p\n",
-		task_args, task_args->t->pid, task_args->nr_threads, task_args->clone_restore_fn,
-		task_args->thread_args);
+		ta, ta->t->pid, ta->nr_threads, ta->clone_restore_fn,
+		ta->thread_args);
 
 	/*
 	 * An indirect call to task_restore, note it never returns
 	 * and restoring core is extremely destructive.
 	 */
 
-	JUMP_TO_RESTORER_BLOB(new_sp, restore_task_exec_start, task_args);
+	JUMP_TO_RESTORER_BLOB(new_sp, restore_task_exec_start, ta);
 
 err:
 	free_mappings(&self_vmas);
