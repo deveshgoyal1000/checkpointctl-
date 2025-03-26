@@ -57,7 +57,7 @@ bool is_using_host_mntns(void)
 }
 
 int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
-                int fd_usernsd, int userns_fd)
+                int fd_usernsd)
 {
     int ret;
     void *stack;

@@ -5,7 +5,7 @@
 #include "common/compiler.h"
 
 extern int userns_call(int (*fn)(void *), int flags, void *arg, size_t arg_size,
-		      int fd_usernsd, int userns_fd);
+		      int fd_usernsd);
 
 /* Check if the process is running in its own user namespace */
 extern bool is_in_userns(void);

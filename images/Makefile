@@ -44,6 +44,7 @@ proto-obj-y	+= ipc-desc.o
 proto-obj-y	+= ipc-shm.o
 proto-obj-y	+= ipc-msg.o
 proto-obj-y	+= ipc-sem.o
+proto-obj-y	+= ipcns.o
 proto-obj-y	+= utsns.o
 proto-obj-y	+= creds.o
 proto-obj-y	+= vma.o
